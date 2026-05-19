@@ -1,0 +1,6 @@
+So, on the highway env, the objects seem to really give it a hard time.
+
+What I'm currently trying to do, is train a new model off of the env, without
+the objects in the way of the parking space. This is basically to get it to 
+recognize what success is, and then to iterate, and add the objects in the way, 
+and see if it can get around it
