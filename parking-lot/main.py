@@ -1,55 +1,45 @@
+import argparse
 import os
+
+import numpy as np
 import gymnasium
 from gymnasium.wrappers import RecordVideo
-import highway_env  # noqa: F401 — needed for the 'parking-v0' registration
-from stable_baselines3 import PPO, SAC, HerReplayBuffer
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.vec_env import SubprocVecEnv
+import highway_env  # noqa: F401 — registers highway-env envs
+import bus_parking_env  # noqa: F401 — registers bus-parking-v0
 
-ENV_ID = "parking-v0"
-ENV_CONFIG = {"reward_weights": [1, 0.2, 0.1, 0.1, 0.03, 0.03]}
-N_ENVS = 16  # tune to your CPU; start with min(8, os.cpu_count())
+from stable_baselines3 import SAC, HerReplayBuffer
+from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.vec_env import DummyVecEnv
+
+ENV_ID = "bus-parking-v0"
+MODEL_PATH = "parking_sac/model"
+VIDEO_DIR = "parking_videos"
+TENSORBOARD_DIR = "parking_sac_her"
+N_ENVS = 8
+
+# Override bus_parking_env defaults here if needed
+ENV_CONFIG = {}
 
 
 def make_env(render_mode=None):
-    # Note: no render_mode here — rendering inside subprocesses is wasteful
     return gymnasium.make(ENV_ID, render_mode=render_mode, config=ENV_CONFIG)
 
 
-def main():
-    # vec_env = make_vec_env(
-    #     make_env,
-    #     n_envs=N_ENVS,
-    #     vec_env_cls=SubprocVecEnv,
-    #     vec_env_kwargs={"start_method": "spawn"},  # safest on Linux too
-    # )
+def build_model(env, *, load_path: str | None = None):
+    if load_path:
+        return SAC.load(load_path, env=env)
 
-    # model = PPO(
-    #     "MultiInputPolicy",
-    #     vec_env,
-    #     policy_kwargs=dict(net_arch=[256, 256]),
-    #     n_steps=2048,            # per env -> total rollout = N_ENVS * 2048
-    #     n_epochs=10,
-    #     learning_rate=5e-5,
-    #     batch_size=256,          # must divide N_ENVS * n_steps
-    #     gamma=0.99,
-    #     verbose=1,
-    #     tensorboard_log="parking_ppo/",
-    # )
-
-    env = make_env()
-
-    model = SAC(
+    return SAC(
         "MultiInputPolicy",
         env,
         replay_buffer_class=HerReplayBuffer,
         replay_buffer_kwargs=dict(
             n_sampled_goal=4,
-            goal_selection_strategy="future"
+            goal_selection_strategy="future",
         ),
-        learning_rate=1e-3,
+        learning_rate=3e-4,
         buffer_size=int(1e6),
-        learning_starts=1000,
+        learning_starts=2000,
         batch_size=256,
         gamma=0.95,
         tau=0.05,
@@ -59,40 +49,100 @@ def main():
         policy_kwargs=dict(net_arch=[256, 256]),
         device="cpu",
         verbose=1,
-        tensorboard_log="parking_sac_her"
+        tensorboard_log=TENSORBOARD_DIR,
     )
 
-    model = SAC.load("parking_sac/model", env=env)
-    model.learn(total_timesteps=100_000)  # bump this up — see notes below
-    model.save("parking_sac/model")
-    # vec_env.close()
-    env.close()
 
-    # --- evaluation / video recording: use a single env, not the SubprocVecEnv ---
-    # eval_env = gymnasium.make(
-    #     ENV_ID, render_mode="rgb_array", config=ENV_CONFIG)
-    # eval_env = RecordVideo(
-    #     eval_env,
-    #     video_folder="parking_videos/",
-    #     episode_trigger=lambda e: True,
-    # )
+def train(timesteps: int, resume: bool, fresh: bool):
+    env = make_vec_env(make_env, n_envs=N_ENVS, vec_env_cls=DummyVecEnv)
+    if fresh and os.path.exists(f"{MODEL_PATH}.zip"):
+        os.remove(f"{MODEL_PATH}.zip")
+        print(f"Removed old checkpoint at {MODEL_PATH} (--fresh)")
+    load_path = MODEL_PATH if resume and os.path.exists(f"{MODEL_PATH}.zip") else None
+    model = build_model(env, load_path=load_path)
+    model.learn(total_timesteps=timesteps)
+    model.save(MODEL_PATH)
+    env.close()
+    print(f"Saved model to {MODEL_PATH}")
+
+
+def evaluate(episodes: int):
+    # HER checkpoints need an env at load time (for compute_reward), but not
+    # the RecordVideo wrapper — that interferes with reset/render.
+    load_env = make_env()
+    model = SAC.load(MODEL_PATH, env=load_env)
+    load_env.close()
+
+    base = make_env(render_mode="rgb_array")
+    base.reset()
+    _ = base.render()  # init pygame viewer before RecordVideo
 
     eval_env = RecordVideo(
-        make_env(render_mode='rgb_array'),
-        video_folder="parking_videos",
+        base,
+        video_folder=VIDEO_DIR,
         episode_trigger=lambda e: True,
+        name_prefix="bus_park",
     )
-
-    model = SAC.load("parking_sac/model", env=eval_env)
     try:
-        for _ in range(10):
+        for ep in range(episodes):
             done = truncated = False
             obs, info = eval_env.reset()
+            steps = 0
+            max_speed = 0.0
             while not (done or truncated):
                 action, _ = model.predict(obs, deterministic=True)
+                action = np.asarray(action).reshape(-1)
                 obs, reward, done, truncated, info = eval_env.step(action)
+                steps += 1
+                v = eval_env.unwrapped.vehicle
+                max_speed = max(max_speed, abs(v.speed))
+            success = info.get("is_success", False)
+            print(
+                f"episode {ep + 1}: steps={steps} max_speed={max_speed:.2f} "
+                f"success={success} last_reward={reward:.3f}"
+            )
     finally:
         eval_env.close()
+    print(f"Wrote videos to {VIDEO_DIR}/")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train or evaluate a bus side-of-road parking policy."
+    )
+    parser.add_argument(
+        "mode",
+        choices=["train", "eval"],
+        help="train: SAC+HER learning; eval: record rollout videos",
+    )
+    parser.add_argument(
+        "--timesteps",
+        type=int,
+        default=500_000,
+        help="training timesteps (default: 500000)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue from parking_sac/model if it exists",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="delete old checkpoint and train from scratch (needed after env changes)",
+    )
+    parser.add_argument(
+        "--episodes",
+        type=int,
+        default=5,
+        help="evaluation episodes to record (default: 5)",
+    )
+    args = parser.parse_args()
+
+    if args.mode == "train":
+        train(args.timesteps, args.resume, args.fresh)
+    else:
+        evaluate(args.episodes)
 
 
 if __name__ == "__main__":
