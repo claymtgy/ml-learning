@@ -18,11 +18,45 @@ TENSORBOARD_DIR = "parking_sac_her"
 N_ENVS = 8
 
 # Override bus_parking_env defaults here if needed
-ENV_CONFIG = {}
+ENV_CONFIG = {
+    "reward_weights": [1.0, 2.0, 0.15, 0.15, 0.05, 0.05],
+    "time_penalty": 0.05,
+    "collision_reward": -10,
+    "pull_off_width": 5.0,
+}
 
 
 def make_env(render_mode=None):
     return gymnasium.make(ENV_ID, render_mode=render_mode, config=ENV_CONFIG)
+
+
+def _her_buffer_ready(model) -> bool:
+    return isinstance(model.replay_buffer, HerReplayBuffer) and bool(
+        np.any(model.replay_buffer.ep_length > 0)
+    )
+
+
+def prepare_her_buffer(model, env, *, resume: bool) -> None:
+    """
+    HER cannot sample until a full episode is stored. SAC.load() does not restore
+    the replay buffer, so defer gradients until new rollouts finish episodes.
+    """
+    if _her_buffer_ready(model):
+        return
+
+    duration = int(env.envs[0].unwrapped.config["duration"])
+    # VecEnv advances all envs each step; need duration steps per env minimum.
+    min_steps = duration * N_ENVS + 64
+    if resume:
+        model.learning_starts = model.num_timesteps + min_steps
+    else:
+        model.learning_starts = max(model.learning_starts, min_steps)
+
+    print(
+        "HER replay buffer is empty (normal after --resume); "
+        f"collect-only until timestep {model.learning_starts} "
+        f"(~{duration} steps/env for episodes to finish)."
+    )
 
 
 def build_model(env, *, load_path: str | None = None):
@@ -55,15 +89,38 @@ def build_model(env, *, load_path: str | None = None):
 
 def train(timesteps: int, resume: bool, fresh: bool):
     env = make_vec_env(make_env, n_envs=N_ENVS, vec_env_cls=DummyVecEnv)
-    if fresh and os.path.exists(f"{MODEL_PATH}.zip"):
-        os.remove(f"{MODEL_PATH}.zip")
-        print(f"Removed old checkpoint at {MODEL_PATH} (--fresh)")
-    load_path = MODEL_PATH if resume and os.path.exists(f"{MODEL_PATH}.zip") else None
-    model = build_model(env, load_path=load_path)
-    model.learn(total_timesteps=timesteps)
-    model.save(MODEL_PATH)
-    env.close()
-    print(f"Saved model to {MODEL_PATH}")
+    model = None
+    try:
+        if fresh and os.path.exists(f"{MODEL_PATH}.zip"):
+            os.remove(f"{MODEL_PATH}.zip")
+            print(f"Removed old checkpoint at {MODEL_PATH} (--fresh)")
+        load_path = (
+            MODEL_PATH if resume and os.path.exists(
+                f"{MODEL_PATH}.zip") else None
+        )
+        model = build_model(env, load_path=load_path)
+
+        if isinstance(model.replay_buffer, HerReplayBuffer):
+            prepare_her_buffer(model, env, resume=bool(load_path))
+
+        if resume and load_path:
+            total_timesteps = model.num_timesteps + timesteps
+            reset_num_timesteps = False
+        else:
+            total_timesteps = timesteps
+            reset_num_timesteps = True
+
+        model.learn(
+            total_timesteps=total_timesteps,
+            reset_num_timesteps=reset_num_timesteps,
+        )
+    except KeyboardInterrupt:
+        print("Training interrupted.")
+    finally:
+        if model is not None:
+            model.save(MODEL_PATH)
+            print(f"Saved model to {MODEL_PATH}")
+        env.close()
 
 
 def evaluate(episodes: int):
@@ -108,7 +165,7 @@ def evaluate(episodes: int):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train or evaluate a bus side-of-road parking policy."
+        description="Train or evaluate a bus pull-off policy (road + shoulder bays)."
     )
     parser.add_argument(
         "mode",
@@ -129,7 +186,7 @@ def main():
     parser.add_argument(
         "--fresh",
         action="store_true",
-        help="delete old checkpoint and train from scratch (needed after env changes)",
+        help="delete old checkpoint and train from scratch (required after env layout changes)",
     )
     parser.add_argument(
         "--episodes",
