@@ -26,7 +26,7 @@ ENV_CONFIG = {
     "lanes_count": 4,
     "vehicles_count": 30,
     "duration": 40,
-    "collision_reward": -1.0,
+    "collision_reward": -3.0,
     "high_speed_reward": 0.4,
     "right_lane_reward": 0.1,
     "normalize_reward": True,
@@ -179,6 +179,10 @@ def evaluate(episodes: int, fast: bool, device: str):
         episode_trigger=lambda e: True,
         name_prefix="highway",
     )
+    # Required for smooth video: capture all simulation substeps, not just 1 Hz policy steps.
+    # https://highway-env.farama.org/faq/
+    eval_env.unwrapped.set_record_video_wrapper(eval_env)
+
     try:
         for ep in range(episodes):
             done = truncated = False
